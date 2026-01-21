@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 PostgreSQL Schema DDL Generator
-Generates clean DDL statements from a PostgreSQL schema
+Generates clean DDL statements from a PostgreSQL schema with proper dependency ordering
 """
 
 import psycopg2
 import argparse
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 def connect_db(host, port, database, user, password):
@@ -119,23 +119,38 @@ def get_foreign_keys(cursor, schema, table):
     return cursor.fetchall()
 
 
-def get_unique_constraints(cursor, schema, table):
-    """Get unique constraints (excluding primary keys)"""
-    query = """
-        SELECT
-            tc.constraint_name,
-            array_agg(kcu.column_name ORDER BY kcu.ordinal_position) as columns
-        FROM information_schema.table_constraints AS tc
-        JOIN information_schema.key_column_usage AS kcu
-            ON tc.constraint_name = kcu.constraint_name
-            AND tc.table_schema = kcu.table_schema
-        WHERE tc.constraint_type = 'UNIQUE'
-        AND tc.table_schema = %s
-        AND tc.table_name = %s
-        GROUP BY tc.constraint_name;
-    """
-    cursor.execute(query, (schema, table))
-    return cursor.fetchall()
+def topological_sort_tables(tables, table_dependencies):
+    """Sort tables based on foreign key dependencies using topological sort"""
+    # Build adjacency list and in-degree count
+    graph = defaultdict(list)
+    in_degree = {table: 0 for table in tables}
+
+    for table in tables:
+        deps = table_dependencies.get(table, set())
+        for dep in deps:
+            if dep in in_degree and dep != table:  # Ignore self-references
+                graph[dep].append(table)
+                in_degree[table] += 1
+
+    # Kahn's algorithm for topological sorting
+    queue = deque([table for table in tables if in_degree[table] == 0])
+    sorted_tables = []
+
+    while queue:
+        current = queue.popleft()
+        sorted_tables.append(current)
+
+        for neighbor in graph[current]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    # Handle circular dependencies - add remaining tables
+    remaining = [table for table in tables if table not in sorted_tables]
+    if remaining:
+        sorted_tables.extend(sorted(remaining))
+
+    return sorted_tables
 
 
 def format_column_type(data_type, udt_name, char_length, num_precision, num_scale, column_default):
@@ -197,7 +212,7 @@ def generate_create_table(schema, table, columns, pk_columns, fk_data):
         # Add foreign key inline
         if col_name in fk_map:
             ref_table, ref_column = fk_map[col_name]
-            col_def += f" REFERENCES {ref_table}({ref_column})"
+            col_def += f" REFERENCES {schema}.{ref_table}({ref_column})"
 
         # Add NOT NULL
         if nullable == 'NO' and col_name not in pk_columns:
@@ -230,6 +245,7 @@ def generate_ddl(host, port, database, user, password, schema, output_file):
     ddl_output = []
     ddl_output.append(f"-- DDL for schema: {schema}")
     ddl_output.append(f"-- Generated from database: {database}\n")
+    ddl_output.append(f"CREATE SCHEMA IF NOT EXISTS {schema};\n")  
 
     # Generate ENUM types
     ddl_output.append("-- ENUM Types")
@@ -242,7 +258,7 @@ def generate_ddl(host, port, database, user, password, schema, output_file):
     else:
         ddl_output.append("-- No ENUM types found\n")
 
-    # Generate tables
+    # Get all tables
     ddl_output.append("-- Tables")
     tables = get_tables(cursor, schema)
 
@@ -252,13 +268,44 @@ def generate_ddl(host, port, database, user, password, schema, output_file):
         conn.close()
         sys.exit(1)
 
+    # Build dependency map
+    table_dependencies = {}
+    table_data = {}
+
     for table in tables:
         columns = get_table_columns(cursor, schema, table)
         pk_columns = get_primary_key(cursor, schema, table)
         fk_data = get_foreign_keys(cursor, schema, table)
 
+        # Store table data
+        table_data[table] = {
+            'columns': columns,
+            'pk_columns': pk_columns,
+            'fk_data': fk_data
+        }
+
+        # Extract dependencies (referenced tables)
+        dependencies = set()
+        for fk in fk_data:
+            ref_table = fk[1]
+            if ref_table != table:  # Ignore self-references
+                dependencies.add(ref_table)
+        table_dependencies[table] = dependencies
+
+    # Sort tables by dependencies
+    sorted_tables = topological_sort_tables(tables, table_dependencies)
+
+    # Generate CREATE TABLE statements in dependency order
+    for table in sorted_tables:
+        data = table_data[table]
         ddl_output.append(f"\n-- Table: {table}")
-        ddl_output.append(generate_create_table(schema, table, columns, pk_columns, fk_data))
+        ddl_output.append(generate_create_table(
+            schema, 
+            table, 
+            data['columns'], 
+            data['pk_columns'], 
+            data['fk_data']
+        ))
 
     cursor.close()
     conn.close()
@@ -275,7 +322,7 @@ def generate_ddl(host, port, database, user, password, schema, output_file):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate clean DDL from PostgreSQL schema',
+        description='Generate clean DDL from PostgreSQL schema with proper dependency ordering',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
