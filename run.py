@@ -43,6 +43,34 @@ def get_enums(cursor, schema):
     cursor.execute(query, (schema,))
     return cursor.fetchall()
 
+def get_composite_types(cursor, schema):
+    """Get all composite types in the schema"""
+    query = """
+        SELECT
+            t.typname as type_name,
+            array_agg(
+                a.attname || ' ' || 
+                format_type(a.atttypid, a.atttypmod)
+                ORDER BY a.attnum
+            ) as attributes
+        FROM pg_type t
+        JOIN pg_namespace n ON t.typnamespace = n.oid
+        JOIN pg_attribute a ON a.attrelid = t.typrelid
+        WHERE n.nspname = %s
+        AND t.typtype = 'c'
+        AND a.attnum > 0
+        -- filter out regular tables, views, and mat views - leaving only true composite types
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_class c 
+            WHERE c.oid = t.typrelid 
+            AND c.relkind IN ('r', 'v', 'm')
+        )
+        AND NOT a.attisdropped
+        GROUP BY t.typname
+        ORDER BY t.typname;
+    """
+    cursor.execute(query, (schema,))
+    return cursor.fetchall()
 
 def get_tables(cursor, schema):
     """Get all tables in the schema"""
@@ -85,8 +113,45 @@ def get_functions(cursor, schema):
     return cursor.fetchall()
 
 
-def get_indexes_for_table(cursor, schema, table):
-    """Get all indexes for a specific table (excluding primary keys and single unique indexes on id)"""
+def get_single_column_unique_constraints(cursor, schema, table):
+    """Get single-column unique constraints for inlining"""
+    query = """
+        SELECT
+            kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'UNIQUE'
+        AND tc.table_schema = %s
+        AND tc.table_name = %s
+        GROUP BY tc.constraint_name, kcu.column_name
+        HAVING COUNT(*) = 1;
+    """
+    cursor.execute(query, (schema, table))
+    return [row[0] for row in cursor.fetchall()]
+
+
+def get_unique_constraints_columns(cursor, schema, table):
+    """Get all unique constraints with their column lists for filtering indexes"""
+    query = """
+        SELECT
+            string_agg(kcu.column_name, ', ' ORDER BY kcu.ordinal_position) as columns
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'UNIQUE'
+        AND tc.table_schema = %s
+        AND tc.table_name = %s
+        GROUP BY tc.constraint_name;
+    """
+    cursor.execute(query, (schema, table))
+    return [row[0] for row in cursor.fetchall()]
+
+
+def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constraint_columns):
+    """Get all indexes for a specific table (excluding primary keys and unique indexes with constraints)"""
     query = """
         SELECT
             indexname,
@@ -100,23 +165,58 @@ def get_indexes_for_table(cursor, schema, table):
     cursor.execute(query, (schema, table))
     indexes = cursor.fetchall()
 
-    # Filter out single-column unique indexes on 'id' column
+    # Filter out unique indexes that have corresponding constraints
     filtered_indexes = []
     for index_name, index_def in indexes:
         # Skip if it's a unique index on just the id column
         if 'UNIQUE' in index_def.upper() and '(id)' in index_def:
             continue
+
+        # Skip if it's a single-column unique index on any column that's inlined
+        is_single_col_unique = False
+        if 'UNIQUE' in index_def.upper():
+            for col in unique_columns:
+                # Check if index is on this single column (without WHERE clause for filtered indexes)
+                if f'({col})' in index_def and 'WHERE' not in index_def.upper():
+                    is_single_col_unique = True
+                    break
+
+        if is_single_col_unique:
+            continue
+
+        # Skip if it's a multi-column unique index that matches a unique constraint
+        # Extract columns from index definition
+        if 'UNIQUE' in index_def.upper() and 'WHERE' not in index_def.upper():
+            # Try to match against unique constraint columns
+            skip_index = False
+            for constraint_cols in unique_constraint_columns:
+                # Normalize column list from index def
+                # Example: "USING btree (permission_group_id, permission_id)"
+                if '(' in index_def and ')' in index_def:
+                    cols_part = index_def[index_def.rfind('('):index_def.rfind(')')+1]
+                    # Remove parentheses and clean up
+                    index_cols = cols_part.strip('()').replace(' ', '')
+                    constraint_cols_clean = constraint_cols.replace(' ', '')
+
+                    if index_cols == constraint_cols_clean:
+                        skip_index = True
+                        break
+
+            if skip_index:
+                continue
+
         filtered_indexes.append((index_name, index_def))
 
     return filtered_indexes
 
 
 def get_unique_constraints_for_table(cursor, schema, table):
-    """Get unique constraints for a specific table"""
+    """Get unique constraints for a specific table (multi-column only)"""
     query = """
         SELECT
             tc.constraint_name,
-            string_agg(kcu.column_name, ', ' ORDER BY kcu.ordinal_position) as columns
+            string_agg(kcu.column_name, ', ' ORDER BY kcu.ordinal_position) as columns,
+            COUNT(*) as column_count
         FROM information_schema.table_constraints tc
         JOIN information_schema.key_column_usage kcu
             ON tc.constraint_name = kcu.constraint_name
@@ -125,10 +225,11 @@ def get_unique_constraints_for_table(cursor, schema, table):
         AND tc.table_schema = %s
         AND tc.table_name = %s
         GROUP BY tc.constraint_name
+        HAVING COUNT(*) > 1
         ORDER BY tc.constraint_name;
     """
     cursor.execute(query, (schema, table))
-    return cursor.fetchall()
+    return [(name, cols) for name, cols, _ in cursor.fetchall()]
 
 
 def get_check_constraints_for_table(cursor, schema, table):
@@ -204,10 +305,11 @@ def get_primary_key(cursor, schema, table):
 
 
 def get_foreign_keys(cursor, schema, table):
-    """Get foreign key constraints"""
+    """Get foreign key constraints including cross-schema references"""
     query = """
         SELECT
             kcu.column_name,
+            ccu.table_schema AS foreign_table_schema,
             ccu.table_name AS foreign_table_name,
             ccu.column_name AS foreign_column_name,
             tc.constraint_name
@@ -217,7 +319,6 @@ def get_foreign_keys(cursor, schema, table):
             AND tc.table_schema = kcu.table_schema
         JOIN information_schema.constraint_column_usage AS ccu
             ON ccu.constraint_name = tc.constraint_name
-            AND ccu.table_schema = tc.table_schema
         WHERE tc.constraint_type = 'FOREIGN KEY'
         AND tc.table_schema = %s
         AND tc.table_name = %s
@@ -261,7 +362,7 @@ def topological_sort_tables(tables, table_dependencies):
     return sorted_tables
 
 
-def format_column_type(data_type, udt_name, char_length, num_precision, num_scale, column_default):
+def format_column_type(data_type, udt_name, char_length, num_precision, num_scale, column_default, schema):
     """Format column type with proper syntax"""
     # Handle SERIAL types
     if column_default and 'nextval' in column_default:
@@ -294,37 +395,41 @@ def format_column_type(data_type, udt_name, char_length, num_precision, num_scal
 
     # Use udt_name for custom types (enums)
     if data_type == 'USER-DEFINED':
-        return udt_name
+        return f'{schema}.{udt_name}'
 
     return data_type
 
 
-def generate_create_table(schema, table, columns, pk_columns, fk_data):
+def generate_create_table(schema, table, columns, pk_columns, fk_data, unique_columns):
     """Generate CREATE TABLE statement"""
     lines = []
     lines.append(f"CREATE TABLE {schema}.{table} (")
 
     column_defs = []
-    fk_map = {fk[0]: (fk[1], fk[2]) for fk in fk_data}
+    fk_map = {fk[0]: (fk[1], fk[2], fk[3]) for fk in fk_data}
 
     for col in columns:
         col_name, data_type, udt_name, char_len, num_prec, num_scale, nullable, default, position = col
 
-        col_type = format_column_type(data_type, udt_name, char_len, num_prec, num_scale, default)
+        col_type = format_column_type(data_type, udt_name, char_len, num_prec, num_scale, default, schema)
         col_def = f"    {col_name} {col_type}"
 
         # Add primary key inline for single column PKs
         if col_name in pk_columns and len(pk_columns) == 1:
             col_def += " PRIMARY KEY"
 
-        # Add foreign key inline
+        # Add foreign key inline (with schema prefix if cross-schema)
         if col_name in fk_map:
-            ref_table, ref_column = fk_map[col_name]
-            col_def += f" REFERENCES {schema}.{ref_table}({ref_column})"
+            ref_schema, ref_table, ref_column = fk_map[col_name]
+            col_def += f" REFERENCES {ref_schema}.{ref_table}({ref_column})"
 
         # Add NOT NULL
         if nullable == 'NO' and col_name not in pk_columns:
             col_def += " NOT NULL"
+
+        # Add UNIQUE for single-column unique constraints
+        if col_name in unique_columns:
+            col_def += " UNIQUE"
 
         # Add DEFAULT (skip for serial types)
         if default and 'nextval' not in default:
@@ -355,6 +460,15 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
     ddl_output.append(f"-- Generated from database: {database}\n")
     ddl_output.append(f"CREATE SCHEMA IF NOT EXISTS {schema};\n")
 
+    # Generate composite types
+    composite_types = get_composite_types(cursor, schema)
+    if composite_types:
+        ddl_output.append("-- Composite Types")
+        for type_name, attributes in composite_types:
+            attrs_str = ',\n    '.join(attributes)
+            ddl_output.append(f"CREATE TYPE {schema}.{type_name} AS (\n    {attrs_str}\n);")
+        ddl_output.append("")
+        
     # Generate ENUM types
     enums = get_enums(cursor, schema)
     if enums:
@@ -378,19 +492,24 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
             columns = get_table_columns(cursor, schema, table)
             pk_columns = get_primary_key(cursor, schema, table)
             fk_data = get_foreign_keys(cursor, schema, table)
+            unique_columns = get_single_column_unique_constraints(cursor, schema, table)
+            unique_constraint_columns = get_unique_constraints_columns(cursor, schema, table)
 
             # Store table data
             table_data[table] = {
                 'columns': columns,
                 'pk_columns': pk_columns,
-                'fk_data': fk_data
+                'fk_data': fk_data,
+                'unique_columns': unique_columns,
+                'unique_constraint_columns': unique_constraint_columns
             }
 
-            # Extract dependencies (referenced tables)
+            # Extract dependencies (only for same-schema references for ordering)
             dependencies = set()
             for fk in fk_data:
-                ref_table = fk[1]
-                if ref_table != table:  # Ignore self-references
+                col_name, ref_schema, ref_table, ref_column, constraint_name = fk
+                # Only track dependencies within the same schema for topological sort
+                if ref_schema == schema and ref_table != table:
                     dependencies.add(ref_table)
             table_dependencies[table] = dependencies
 
@@ -406,15 +525,16 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
                 table, 
                 data['columns'], 
                 data['pk_columns'], 
-                data['fk_data']
+                data['fk_data'],
+                data['unique_columns']
             ))
 
-            # Add indexes for this table
-            indexes = get_indexes_for_table(cursor, schema, table)
+            # Add indexes for this table (pass constraint columns to filter)
+            indexes = get_indexes_for_table(cursor, schema, table, data['unique_columns'], data['unique_constraint_columns'])
             for index_name, index_def in indexes:
                 ddl_output.append(f"{index_def};")
 
-            # Add unique constraints for this table
+            # Add unique constraints for this table (multi-column only now)
             unique_constraints = get_unique_constraints_for_table(cursor, schema, table)
             for constraint_name, columns in unique_constraints:
                 ddl_output.append(f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {constraint_name} UNIQUE ({columns});")
@@ -423,6 +543,15 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
             check_constraints = get_check_constraints_for_table(cursor, schema, table)
             for constraint_name, check_clause in check_constraints:
                 ddl_output.append(f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {constraint_name} CHECK ({check_clause});")
+
+        # Generate functions if requested
+    if include_functions:
+        functions = get_functions(cursor, schema)
+        if functions:
+            ddl_output.append("-- Functions")
+            for func_name, func_def in functions:
+                ddl_output.append(f"{func_def};")
+                ddl_output.append("")
 
     # Generate views if requested
     if include_views:
@@ -434,15 +563,6 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
                 if not view_def.endswith(';'):
                     view_def += ';'
                 ddl_output.append(f"CREATE OR REPLACE VIEW {schema}.{view_name} AS\n{view_def}")
-                ddl_output.append("")
-
-    # Generate functions if requested
-    if include_functions:
-        functions = get_functions(cursor, schema)
-        if functions:
-            ddl_output.append("-- Functions")
-            for func_name, func_def in functions:
-                ddl_output.append(func_def)
                 ddl_output.append("")
 
     cursor.close()

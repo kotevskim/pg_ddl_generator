@@ -10,6 +10,7 @@ Python tool that generates clean DDL from a PostgreSQL schema – suitable for s
   - Inlined `NOT NULL` constraints
 - Exports:
   - ENUM types (`CREATE TYPE ... AS ENUM`)
+  - Composite types (`CREATE TYPE ... AS (...)`)
   - Tables (`CREATE TABLE ...`)
   - (Optional) Views
   - (Optional) Functions
