@@ -28,30 +28,29 @@ def connect_db(host, port, database, user, password):
         print(f"Error connecting to database: {e}", file=sys.stderr)
         sys.exit(1)
 
-
-
 def get_schema_dependencies(cursor, schemas):
-    """Get cross-schema foreign key dependencies"""
+    """Get cross-schema foreign key dependencies using pg_catalog"""
     query = """
         SELECT DISTINCT
-            tc.table_schema AS source_schema,
-            ccu.table_schema AS target_schema
-        FROM information_schema.table_constraints AS tc
-        JOIN information_schema.constraint_column_usage AS ccu
-            ON tc.constraint_name = ccu.constraint_name
-        WHERE tc.constraint_type = 'FOREIGN KEY'
-        AND tc.table_schema = ANY(%s)
-        AND ccu.table_schema = ANY(%s)
-        AND tc.table_schema != ccu.table_schema;
+            source_ns.nspname AS source_schema,
+            target_ns.nspname AS target_schema
+        FROM pg_constraint con
+        JOIN pg_class source_rel ON con.conrelid = source_rel.oid
+        JOIN pg_namespace source_ns ON source_rel.relnamespace = source_ns.oid
+        JOIN pg_class target_rel ON con.confrelid = target_rel.oid
+        JOIN pg_namespace target_ns ON target_rel.relnamespace = target_ns.oid
+        WHERE con.contype = 'f'
+        AND source_ns.nspname = ANY(%s)
+        AND target_ns.nspname = ANY(%s)
+        AND source_ns.nspname != target_ns.nspname;
     """
     cursor.execute(query, (schemas, schemas))
-
+    
     dependencies = defaultdict(set)
     for source_schema, target_schema in cursor.fetchall():
         dependencies[source_schema].add(target_schema)
-
+    
     return dependencies
-
 
 def topological_sort_schemas(schemas, schema_dependencies):
     """Sort schemas based on cross-schema foreign key dependencies"""
@@ -65,6 +64,15 @@ def topological_sort_schemas(schemas, schema_dependencies):
             if dep in in_degree and dep != schema:
                 graph[dep].append(schema)
                 in_degree[schema] += 1
+                
+    # DEBUG: Print the graph
+    # print("DEBUG: Dependency graph for resource and organizations:")
+    # print(f"  resource -> {graph.get('resource', [])}")
+    # print(f"  organizations -> {graph.get('organizations', [])}")
+    # print(f"  resource in_degree: {in_degree.get('resource', 0)}")
+    # print(f"  organizations in_degree: {in_degree.get('organizations', 0)}")
+    # print(f"  organizations dependencies: {schema_dependencies.get('organizations', set())}")
+    # print(f"  resource dependencies: {schema_dependencies.get('resource', set())}")
 
     # Kahn's algorithm for topological sorting
     queue = deque([schema for schema in schemas if in_degree[schema] == 0])
@@ -217,8 +225,21 @@ def get_unique_constraints_columns(cursor, schema, table):
 
 
 
-def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constraint_columns):
+def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constraint_columns, pk_columns):
     """Get all indexes for a specific table (excluding primary keys and unique indexes with constraints)"""
+    
+    # First, get all constraint names for this table (PK and UNIQUE)
+    constraint_query = """
+        SELECT constraint_name
+        FROM information_schema.table_constraints
+        WHERE table_schema = %s
+        AND table_name = %s
+        AND constraint_type IN ('PRIMARY KEY', 'UNIQUE');
+    """
+    cursor.execute(constraint_query, (schema, table))
+    constraint_names = {row[0] for row in cursor.fetchall()}
+    
+    # Now get indexes
     query = """
         SELECT
             indexname,
@@ -232,14 +253,27 @@ def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constrai
     cursor.execute(query, (schema, table))
     indexes = cursor.fetchall()
 
-
     # Filter out unique indexes that have corresponding constraints
     filtered_indexes = []
     for index_name, index_def in indexes:
+        # Skip if this index name matches a constraint name
+        if index_name in constraint_names:
+            continue
+            
         # Skip if it's a unique index on just the id column
         if 'UNIQUE' in index_def.upper() and '(id)' in index_def:
             continue
 
+        # Skip if it's a unique index on any single-column primary key
+        skip_pk_index = False
+        if 'UNIQUE' in index_def.upper() and len(pk_columns) == 1:
+            for pk_col in pk_columns:
+                if f'({pk_col})' in index_def and 'WHERE' not in index_def.upper():
+                    skip_pk_index = True
+                    break
+        
+        if skip_pk_index:
+            continue
 
         # Skip if it's a single-column unique index on any column that's inlined
         is_single_col_unique = False
@@ -250,10 +284,8 @@ def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constrai
                     is_single_col_unique = True
                     break
 
-
         if is_single_col_unique:
             continue
-
 
         # Skip if it's a multi-column unique index that matches a unique constraint
         # Extract columns from index definition
@@ -269,21 +301,16 @@ def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constrai
                     index_cols = cols_part.strip('()').replace(' ', '')
                     constraint_cols_clean = constraint_cols.replace(' ', '')
 
-
                     if index_cols == constraint_cols_clean:
                         skip_index = True
                         break
 
-
             if skip_index:
                 continue
 
-
         filtered_indexes.append((index_name, index_def))
 
-
     return filtered_indexes
-
 
 
 def get_unique_constraints_for_table(cursor, schema, table):
@@ -357,7 +384,11 @@ def get_table_columns(cursor, schema, table):
             c.numeric_scale,
             c.is_nullable,
             c.column_default,
-            c.ordinal_position
+            c.ordinal_position,
+            CASE 
+                WHEN c.data_type = 'USER-DEFINED' THEN c.udt_schema
+                ELSE NULL
+            END as udt_schema
         FROM information_schema.columns c
         WHERE c.table_schema = %s
         AND c.table_name = %s
@@ -385,30 +416,29 @@ def get_primary_key(cursor, schema, table):
     return [row[0] for row in cursor.fetchall()]
 
 
-
 def get_foreign_keys(cursor, schema, table):
-    """Get foreign key constraints including cross-schema references"""
+    """Get foreign key constraints including cross-schema references using pg_catalog"""
     query = """
         SELECT
-            kcu.column_name,
-            ccu.table_schema AS foreign_table_schema,
-            ccu.table_name AS foreign_table_name,
-            ccu.column_name AS foreign_column_name,
-            tc.constraint_name
-        FROM information_schema.table_constraints AS tc
-        JOIN information_schema.key_column_usage AS kcu
-            ON tc.constraint_name = kcu.constraint_name
-            AND tc.table_schema = kcu.table_schema
-        JOIN information_schema.constraint_column_usage AS ccu
-            ON ccu.constraint_name = tc.constraint_name
-        WHERE tc.constraint_type = 'FOREIGN KEY'
-        AND tc.table_schema = %s
-        AND tc.table_name = %s
-        ORDER BY kcu.ordinal_position;
+            a.attname AS column_name,
+            target_ns.nspname AS foreign_table_schema,
+            target_class.relname AS foreign_table_name,
+            target_a.attname AS foreign_column_name,
+            con.conname AS constraint_name
+        FROM pg_constraint con
+        JOIN pg_class source_class ON con.conrelid = source_class.oid
+        JOIN pg_namespace source_ns ON source_class.relnamespace = source_ns.oid
+        JOIN pg_class target_class ON con.confrelid = target_class.oid
+        JOIN pg_namespace target_ns ON target_class.relnamespace = target_ns.oid
+        JOIN pg_attribute a ON a.attnum = ANY(con.conkey) AND a.attrelid = con.conrelid
+        JOIN pg_attribute target_a ON target_a.attnum = ANY(con.confkey) AND target_a.attrelid = con.confrelid
+        WHERE con.contype = 'f'
+        AND source_ns.nspname = %s
+        AND source_class.relname = %s
+        ORDER BY a.attnum;
     """
     cursor.execute(query, (schema, table))
     return cursor.fetchall()
-
 
 
 def topological_sort_tables(tables, table_dependencies):
@@ -450,9 +480,7 @@ def topological_sort_tables(tables, table_dependencies):
 
     return sorted_tables
 
-
-
-def format_column_type(data_type, udt_name, char_length, num_precision, num_scale, column_default, schema):
+def format_column_type(data_type, udt_name, char_length, num_precision, num_scale, column_default, udt_schema):
     """Format column type with proper syntax"""
     # Handle SERIAL types
     if column_default and 'nextval' in column_default:
@@ -463,6 +491,30 @@ def format_column_type(data_type, udt_name, char_length, num_precision, num_scal
         elif data_type == 'smallint':
             return 'smallserial'
 
+    # Handle ARRAY types
+    if data_type == 'ARRAY':
+        # udt_name will be like '_text' for text[], '_int4' for integer[]
+        array_type_map = {
+            '_text': 'text[]',
+            '_varchar': 'varchar[]',
+            '_char': 'char[]',
+            '_int2': 'smallint[]',
+            '_int4': 'integer[]',
+            '_int8': 'bigint[]',
+            '_float4': 'real[]',
+            '_float8': 'double precision[]',
+            '_numeric': 'numeric[]',
+            '_bool': 'boolean[]',
+            '_date': 'date[]',
+            '_time': 'time[]',
+            '_timetz': 'timetz[]',
+            '_timestamp': 'timestamp[]',
+            '_timestamptz': 'timestamptz[]',
+            '_uuid': 'uuid[]',
+            '_jsonb': 'jsonb[]',
+            '_json': 'json[]',
+        }
+        return array_type_map.get(udt_name, f'{udt_name.lstrip("_")}[]')
 
     # Handle standard types
     type_map = {
@@ -475,10 +527,8 @@ def format_column_type(data_type, udt_name, char_length, num_precision, num_scal
         'double precision': 'double precision',
     }
 
-
     if data_type in type_map:
         return type_map[data_type]
-
 
     # Handle numeric with precision
     if data_type == 'numeric' and num_precision:
@@ -486,15 +536,11 @@ def format_column_type(data_type, udt_name, char_length, num_precision, num_scal
             return f'numeric({num_precision},{num_scale})'
         return f'numeric({num_precision})'
 
-
     # Use udt_name for custom types (enums)
     if data_type == 'USER-DEFINED':
-        return f'{schema}.{udt_name}'
-
+        return f'{udt_schema}.{udt_name}'
 
     return data_type
-
-
 
 def generate_create_table(schema, table, columns, pk_columns, fk_data, unique_columns):
     """Generate CREATE TABLE statement"""
@@ -507,10 +553,9 @@ def generate_create_table(schema, table, columns, pk_columns, fk_data, unique_co
 
 
     for col in columns:
-        col_name, data_type, udt_name, char_len, num_prec, num_scale, nullable, default, position = col
+        col_name, data_type, udt_name, char_len, num_prec, num_scale, nullable, default, position, udt_schema = col
 
-
-        col_type = format_column_type(data_type, udt_name, char_len, num_prec, num_scale, default, schema)
+        col_type = format_column_type(data_type, udt_name, char_len, num_prec, num_scale, default, udt_schema)
         col_def = f"    {col_name} {col_type}"
 
 
@@ -645,7 +690,7 @@ def generate_schema_ddl(cursor, schema, include_views, include_functions):
 
 
             # Add indexes for this table (pass constraint columns to filter)
-            indexes = get_indexes_for_table(cursor, schema, table, data['unique_columns'], data['unique_constraint_columns'])
+            indexes = get_indexes_for_table(cursor, schema, table, data['unique_columns'], data['unique_constraint_columns'], data['pk_columns'])
             for index_name, index_def in indexes:
                 ddl_output.append(f"{index_def};")
 
