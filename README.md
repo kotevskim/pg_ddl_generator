@@ -53,8 +53,8 @@ python3 run.py \
 ```
 
 Optional Flags:
-`--host` – Database host (default: localhost)
-`--port` – Database port (default: 5432)
-`--output` – Output file (default: stdout)
-`--include-views` – Include views in the output (default: off)
-`--include-functions` – Include functions in the output (default: off)
+- `--host` – Database host (default: localhost)  
+- `--port` – Database port (default: 5432)  
+- `--output` – Output file (default: stdout)   
+- `--include-views` – Include views in the output (default: off)  
+- `--include-functions` – Include functions in the output (default: off)  
