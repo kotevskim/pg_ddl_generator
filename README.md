@@ -14,7 +14,7 @@ Python tool that generates clean DDL from a PostgreSQL schema – suitable for s
   - Tables (`CREATE TABLE ...`)
   - (Optional) Views
   - (Optional) Functions
-- Orders tables using a topological sort so referenced tables are created before dependants.
+- Orders schemas and tables using a topological sort so referenced tables are created before dependants.
 - Excludes unnecessary indexes:
   - Primary key indexes on `id`
   - Single-column unique indexes that mirror constraints
@@ -49,7 +49,7 @@ python3 run.py \
   --database mydb \
   --user myuser \
   --password mypass \
-  --schema person \
+  --schema schemaA,schemaB \
   --output person.sql
 ```
 
@@ -58,4 +58,4 @@ Optional Flags:
 - `--port` Database port (default: 5432)  
 - `--output` Output file (default: stdout)   
 - `--include-views` Include views in the output (default: off)  
-- `--include-functions` Include functions in the output (default: off)  
+- `--include-functions` Include functions in the output (default: off)

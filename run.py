@@ -5,10 +5,12 @@ Generates clean DDL statements from a PostgreSQL schema with proper dependency o
 Includes tables, views, functions, indexes, and constraints
 """
 
+
 import psycopg2
 import argparse
 import sys
 from collections import defaultdict, deque
+
 
 
 def connect_db(host, port, database, user, password):
@@ -27,6 +29,64 @@ def connect_db(host, port, database, user, password):
         sys.exit(1)
 
 
+
+def get_schema_dependencies(cursor, schemas):
+    """Get cross-schema foreign key dependencies"""
+    query = """
+        SELECT DISTINCT
+            tc.table_schema AS source_schema,
+            ccu.table_schema AS target_schema
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.constraint_column_usage AS ccu
+            ON tc.constraint_name = ccu.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND tc.table_schema = ANY(%s)
+        AND ccu.table_schema = ANY(%s)
+        AND tc.table_schema != ccu.table_schema;
+    """
+    cursor.execute(query, (schemas, schemas))
+
+    dependencies = defaultdict(set)
+    for source_schema, target_schema in cursor.fetchall():
+        dependencies[source_schema].add(target_schema)
+
+    return dependencies
+
+
+def topological_sort_schemas(schemas, schema_dependencies):
+    """Sort schemas based on cross-schema foreign key dependencies"""
+    # Build adjacency list and in-degree count
+    graph = defaultdict(list)
+    in_degree = {schema: 0 for schema in schemas}
+
+    for schema in schemas:
+        deps = schema_dependencies.get(schema, set())
+        for dep in deps:
+            if dep in in_degree and dep != schema:
+                graph[dep].append(schema)
+                in_degree[schema] += 1
+
+    # Kahn's algorithm for topological sorting
+    queue = deque([schema for schema in schemas if in_degree[schema] == 0])
+    sorted_schemas = []
+
+    while queue:
+        current = queue.popleft()
+        sorted_schemas.append(current)
+
+        for neighbor in graph[current]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    # Handle circular dependencies - add remaining schemas
+    remaining = [schema for schema in schemas if schema not in sorted_schemas]
+    if remaining:
+        sorted_schemas.extend(sorted(remaining))
+
+    return sorted_schemas
+
+
 def get_enums(cursor, schema):
     """Get all ENUM types in the schema"""
     query = """
@@ -42,6 +102,7 @@ def get_enums(cursor, schema):
     """
     cursor.execute(query, (schema,))
     return cursor.fetchall()
+
 
 def get_composite_types(cursor, schema):
     """Get all composite types in the schema"""
@@ -72,6 +133,7 @@ def get_composite_types(cursor, schema):
     cursor.execute(query, (schema,))
     return cursor.fetchall()
 
+
 def get_tables(cursor, schema):
     """Get all tables in the schema"""
     query = """
@@ -85,6 +147,7 @@ def get_tables(cursor, schema):
     return [row[0] for row in cursor.fetchall()]
 
 
+
 def get_views(cursor, schema):
     """Get all views in the schema"""
     query = """
@@ -95,6 +158,7 @@ def get_views(cursor, schema):
     """
     cursor.execute(query, (schema,))
     return cursor.fetchall()
+
 
 
 def get_functions(cursor, schema):
@@ -111,6 +175,7 @@ def get_functions(cursor, schema):
     """
     cursor.execute(query, (schema,))
     return cursor.fetchall()
+
 
 
 def get_single_column_unique_constraints(cursor, schema, table):
@@ -132,6 +197,7 @@ def get_single_column_unique_constraints(cursor, schema, table):
     return [row[0] for row in cursor.fetchall()]
 
 
+
 def get_unique_constraints_columns(cursor, schema, table):
     """Get all unique constraints with their column lists for filtering indexes"""
     query = """
@@ -150,6 +216,7 @@ def get_unique_constraints_columns(cursor, schema, table):
     return [row[0] for row in cursor.fetchall()]
 
 
+
 def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constraint_columns):
     """Get all indexes for a specific table (excluding primary keys and unique indexes with constraints)"""
     query = """
@@ -165,12 +232,14 @@ def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constrai
     cursor.execute(query, (schema, table))
     indexes = cursor.fetchall()
 
+
     # Filter out unique indexes that have corresponding constraints
     filtered_indexes = []
     for index_name, index_def in indexes:
         # Skip if it's a unique index on just the id column
         if 'UNIQUE' in index_def.upper() and '(id)' in index_def:
             continue
+
 
         # Skip if it's a single-column unique index on any column that's inlined
         is_single_col_unique = False
@@ -181,8 +250,10 @@ def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constrai
                     is_single_col_unique = True
                     break
 
+
         if is_single_col_unique:
             continue
+
 
         # Skip if it's a multi-column unique index that matches a unique constraint
         # Extract columns from index definition
@@ -198,16 +269,21 @@ def get_indexes_for_table(cursor, schema, table, unique_columns, unique_constrai
                     index_cols = cols_part.strip('()').replace(' ', '')
                     constraint_cols_clean = constraint_cols.replace(' ', '')
 
+
                     if index_cols == constraint_cols_clean:
                         skip_index = True
                         break
 
+
             if skip_index:
                 continue
 
+
         filtered_indexes.append((index_name, index_def))
 
+
     return filtered_indexes
+
 
 
 def get_unique_constraints_for_table(cursor, schema, table):
@@ -232,6 +308,7 @@ def get_unique_constraints_for_table(cursor, schema, table):
     return [(name, cols) for name, cols, _ in cursor.fetchall()]
 
 
+
 def get_check_constraints_for_table(cursor, schema, table):
     """Get check constraints for a specific table"""
     query = """
@@ -253,6 +330,7 @@ def get_check_constraints_for_table(cursor, schema, table):
     """
     cursor.execute(query, (schema, table))
 
+
     # Filter out single-column NOT NULL checks
     constraints = []
     for constraint_name, check_clause, column_count in cursor.fetchall():
@@ -262,7 +340,9 @@ def get_check_constraints_for_table(cursor, schema, table):
             continue
         constraints.append((constraint_name, check_clause))
 
+
     return constraints
+
 
 
 def get_table_columns(cursor, schema, table):
@@ -287,6 +367,7 @@ def get_table_columns(cursor, schema, table):
     return cursor.fetchall()
 
 
+
 def get_primary_key(cursor, schema, table):
     """Get primary key constraint"""
     query = """
@@ -302,6 +383,7 @@ def get_primary_key(cursor, schema, table):
     """
     cursor.execute(query, (schema, table))
     return [row[0] for row in cursor.fetchall()]
+
 
 
 def get_foreign_keys(cursor, schema, table):
@@ -328,11 +410,13 @@ def get_foreign_keys(cursor, schema, table):
     return cursor.fetchall()
 
 
+
 def topological_sort_tables(tables, table_dependencies):
     """Sort tables based on foreign key dependencies using topological sort"""
     # Build adjacency list and in-degree count
     graph = defaultdict(list)
     in_degree = {table: 0 for table in tables}
+
 
     for table in tables:
         deps = table_dependencies.get(table, set())
@@ -341,25 +425,31 @@ def topological_sort_tables(tables, table_dependencies):
                 graph[dep].append(table)
                 in_degree[table] += 1
 
+
     # Kahn's algorithm for topological sorting
     queue = deque([table for table in tables if in_degree[table] == 0])
     sorted_tables = []
 
+
     while queue:
         current = queue.popleft()
         sorted_tables.append(current)
+
 
         for neighbor in graph[current]:
             in_degree[neighbor] -= 1
             if in_degree[neighbor] == 0:
                 queue.append(neighbor)
 
+
     # Handle circular dependencies - add remaining tables
     remaining = [table for table in tables if table not in sorted_tables]
     if remaining:
         sorted_tables.extend(sorted(remaining))
 
+
     return sorted_tables
+
 
 
 def format_column_type(data_type, udt_name, char_length, num_precision, num_scale, column_default, schema):
@@ -373,6 +463,7 @@ def format_column_type(data_type, udt_name, char_length, num_precision, num_scal
         elif data_type == 'smallint':
             return 'smallserial'
 
+
     # Handle standard types
     type_map = {
         'character varying': f'varchar({char_length})' if char_length else 'varchar',
@@ -384,8 +475,10 @@ def format_column_type(data_type, udt_name, char_length, num_precision, num_scal
         'double precision': 'double precision',
     }
 
+
     if data_type in type_map:
         return type_map[data_type]
+
 
     # Handle numeric with precision
     if data_type == 'numeric' and num_precision:
@@ -393,11 +486,14 @@ def format_column_type(data_type, udt_name, char_length, num_precision, num_scal
             return f'numeric({num_precision},{num_scale})'
         return f'numeric({num_precision})'
 
+
     # Use udt_name for custom types (enums)
     if data_type == 'USER-DEFINED':
         return f'{schema}.{udt_name}'
 
+
     return data_type
+
 
 
 def generate_create_table(schema, table, columns, pk_columns, fk_data, unique_columns):
@@ -405,60 +501,70 @@ def generate_create_table(schema, table, columns, pk_columns, fk_data, unique_co
     lines = []
     lines.append(f"CREATE TABLE {schema}.{table} (")
 
+
     column_defs = []
     fk_map = {fk[0]: (fk[1], fk[2], fk[3]) for fk in fk_data}
+
 
     for col in columns:
         col_name, data_type, udt_name, char_len, num_prec, num_scale, nullable, default, position = col
 
+
         col_type = format_column_type(data_type, udt_name, char_len, num_prec, num_scale, default, schema)
         col_def = f"    {col_name} {col_type}"
+
 
         # Add primary key inline for single column PKs
         if col_name in pk_columns and len(pk_columns) == 1:
             col_def += " PRIMARY KEY"
+
 
         # Add foreign key inline (with schema prefix if cross-schema)
         if col_name in fk_map:
             ref_schema, ref_table, ref_column = fk_map[col_name]
             col_def += f" REFERENCES {ref_schema}.{ref_table}({ref_column})"
 
+
         # Add NOT NULL
         if nullable == 'NO' and col_name not in pk_columns:
             col_def += " NOT NULL"
+
 
         # Add UNIQUE for single-column unique constraints
         if col_name in unique_columns:
             col_def += " UNIQUE"
 
+
         # Add DEFAULT (skip for serial types)
         if default and 'nextval' not in default:
             col_def += f" DEFAULT {default}"
 
+
         column_defs.append(col_def)
+
 
     # Add composite primary key constraint
     if len(pk_columns) > 1:
         pk_def = f"    PRIMARY KEY ({', '.join(pk_columns)})"
         column_defs.append(pk_def)
 
+
     # Join column definitions with commas and newlines
     columns_text = ",\n".join(column_defs)
     lines.append(columns_text)
     lines.append(");")
 
+
     return "\n".join(lines)
 
 
-def generate_ddl(host, port, database, user, password, schema, output_file, include_views, include_functions):
-    """Main function to generate DDL"""
-    conn = connect_db(host, port, database, user, password)
-    cursor = conn.cursor()
 
+def generate_schema_ddl(cursor, schema, include_views, include_functions):
+    """Generate DDL for a single schema"""
     ddl_output = []
-    ddl_output.append(f"-- DDL for schema: {schema}")
-    ddl_output.append(f"-- Generated from database: {database}\n")
+    ddl_output.append(f"-- Schema: {schema}")
     ddl_output.append(f"CREATE SCHEMA IF NOT EXISTS {schema};\n")
+
 
     # Generate composite types
     composite_types = get_composite_types(cursor, schema)
@@ -468,7 +574,7 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
             attrs_str = ',\n    '.join(attributes)
             ddl_output.append(f"CREATE TYPE {schema}.{type_name} AS (\n    {attrs_str}\n);")
         ddl_output.append("")
-        
+
     # Generate ENUM types
     enums = get_enums(cursor, schema)
     if enums:
@@ -478,15 +584,19 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
             ddl_output.append(f"CREATE TYPE {schema}.{enum_name} AS ENUM ({values_str});")
         ddl_output.append("")
 
+
     # Get all tables
     tables = get_tables(cursor, schema)
+
 
     if tables:
         ddl_output.append("-- Tables")
 
+
         # Build dependency map
         table_dependencies = {}
         table_data = {}
+
 
         for table in tables:
             columns = get_table_columns(cursor, schema, table)
@@ -494,6 +604,7 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
             fk_data = get_foreign_keys(cursor, schema, table)
             unique_columns = get_single_column_unique_constraints(cursor, schema, table)
             unique_constraint_columns = get_unique_constraints_columns(cursor, schema, table)
+
 
             # Store table data
             table_data[table] = {
@@ -504,6 +615,7 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
                 'unique_constraint_columns': unique_constraint_columns
             }
 
+
             # Extract dependencies (only for same-schema references for ordering)
             dependencies = set()
             for fk in fk_data:
@@ -513,8 +625,10 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
                     dependencies.add(ref_table)
             table_dependencies[table] = dependencies
 
+
         # Sort tables by dependencies
         sorted_tables = topological_sort_tables(tables, table_dependencies)
+
 
         # Generate CREATE TABLE statements with their indexes and constraints
         for table in sorted_tables:
@@ -529,29 +643,34 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
                 data['unique_columns']
             ))
 
+
             # Add indexes for this table (pass constraint columns to filter)
             indexes = get_indexes_for_table(cursor, schema, table, data['unique_columns'], data['unique_constraint_columns'])
             for index_name, index_def in indexes:
                 ddl_output.append(f"{index_def};")
+
 
             # Add unique constraints for this table (multi-column only now)
             unique_constraints = get_unique_constraints_for_table(cursor, schema, table)
             for constraint_name, columns in unique_constraints:
                 ddl_output.append(f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {constraint_name} UNIQUE ({columns});")
 
+
             # Add check constraints for this table
             check_constraints = get_check_constraints_for_table(cursor, schema, table)
             for constraint_name, check_clause in check_constraints:
                 ddl_output.append(f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {constraint_name} CHECK ({check_clause});")
 
-        # Generate functions if requested
+
+    # Generate functions if requested
     if include_functions:
         functions = get_functions(cursor, schema)
         if functions:
-            ddl_output.append("-- Functions")
+            ddl_output.append("\n-- Functions")
             for func_name, func_def in functions:
                 ddl_output.append(f"{func_def};")
                 ddl_output.append("")
+
 
     # Generate views if requested
     if include_views:
@@ -565,8 +684,40 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
                 ddl_output.append(f"CREATE OR REPLACE VIEW {schema}.{view_name} AS\n{view_def}")
                 ddl_output.append("")
 
+
+    return ddl_output
+
+
+def generate_ddl(host, port, database, user, password, schemas, output_file, include_views, include_functions):
+    """Main function to generate DDL for multiple schemas"""
+    conn = connect_db(host, port, database, user, password)
+    cursor = conn.cursor()
+
+
+    # Sort schemas by dependencies
+    schema_dependencies = get_schema_dependencies(cursor, schemas)
+    sorted_schemas = topological_sort_schemas(schemas, schema_dependencies)
+
+
+    ddl_output = []
+    ddl_output.append(f"-- DDL for schemas: {', '.join(sorted_schemas)}")
+    ddl_output.append(f"-- Generated from database: {database}")
+    ddl_output.append(f"-- Schema ordering based on foreign key dependencies\n")
+
+
+    # Generate DDL for each schema
+    for i, schema in enumerate(sorted_schemas):
+        if i > 0:
+            ddl_output.append("\n\n" + "--" + "="*80)
+            ddl_output.append("")
+
+        schema_ddl = generate_schema_ddl(cursor, schema, include_views, include_functions)
+        ddl_output.extend(schema_ddl)
+
+
     cursor.close()
     conn.close()
+
 
     # Write to file or stdout
     output = "\n".join(ddl_output)
@@ -578,29 +729,42 @@ def generate_ddl(host, port, database, user, password, schema, output_file, incl
         print(output)
 
 
+
 def main():
     parser = argparse.ArgumentParser(
         description='Generate clean DDL from PostgreSQL schema with proper dependency ordering',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
+  # Single schema
   python pg_ddl_generator.py --host localhost --port 5432 --database mydb \\
                               --user postgres --password secret --schema public \\
                               --output schema.sql --include-views --include-functions
+
+  # Multiple schemas (automatically sorted by dependencies)
+  python pg_ddl_generator.py --host localhost --port 5432 --database mydb \\
+                              --user postgres --password secret --schema access,person,common \\
+                              --output all_schemas.sql
         """
     )
+
 
     parser.add_argument('--host', default='localhost', help='Database host (default: localhost)')
     parser.add_argument('--port', default='5432', help='Database port (default: 5432)')
     parser.add_argument('--database', required=True, help='Database name')
     parser.add_argument('--user', required=True, help='Database user')
     parser.add_argument('--password', required=True, help='Database password')
-    parser.add_argument('--schema', required=True, help='Schema name to generate DDL for')
+    parser.add_argument('--schema', required=True, help='Schema name(s) to generate DDL for (comma-separated for multiple)')
     parser.add_argument('--output', '-o', help='Output file (default: stdout)')
     parser.add_argument('--include-views', action='store_true', help='Include views in the output')
     parser.add_argument('--include-functions', action='store_true', help='Include functions in the output')
 
+
     args = parser.parse_args()
+
+    # Parse schemas (split by comma, strip whitespace)
+    schemas = [s.strip() for s in args.schema.split(',')]
+
 
     generate_ddl(
         args.host,
@@ -608,11 +772,12 @@ Example usage:
         args.database,
         args.user,
         args.password,
-        args.schema,
+        schemas,
         args.output,
         args.include_views,
         args.include_functions
     )
+
 
 
 if __name__ == '__main__':
