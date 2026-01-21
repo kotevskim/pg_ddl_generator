@@ -2,6 +2,7 @@
 """
 PostgreSQL Schema DDL Generator
 Generates clean DDL statements from a PostgreSQL schema with proper dependency ordering
+Includes tables, views, functions, indexes, and constraints
 """
 
 import psycopg2
@@ -54,6 +55,85 @@ def get_tables(cursor, schema):
     """
     cursor.execute(query, (schema,))
     return [row[0] for row in cursor.fetchall()]
+
+
+def get_indexes_for_table(cursor, schema, table):
+    """Get all indexes for a specific table (excluding primary keys and single unique indexes on id)"""
+    query = """
+        SELECT
+            indexname,
+            indexdef
+        FROM pg_indexes
+        WHERE schemaname = %s
+        AND tablename = %s
+        AND indexdef NOT LIKE '%%PRIMARY KEY%%'
+        ORDER BY indexname;
+    """
+    cursor.execute(query, (schema, table))
+    indexes = cursor.fetchall()
+
+    # Filter out single-column unique indexes on 'id' column
+    filtered_indexes = []
+    for index_name, index_def in indexes:
+        # Skip if it's a unique index on just the id column
+        if 'UNIQUE' in index_def.upper() and '(id)' in index_def:
+            continue
+        filtered_indexes.append((index_name, index_def))
+
+    return filtered_indexes
+
+
+def get_unique_constraints_for_table(cursor, schema, table):
+    """Get unique constraints for a specific table"""
+    query = """
+        SELECT
+            tc.constraint_name,
+            string_agg(kcu.column_name, ', ' ORDER BY kcu.ordinal_position) as columns
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'UNIQUE'
+        AND tc.table_schema = %s
+        AND tc.table_name = %s
+        GROUP BY tc.constraint_name
+        ORDER BY tc.constraint_name;
+    """
+    cursor.execute(query, (schema, table))
+    return cursor.fetchall()
+
+
+def get_check_constraints_for_table(cursor, schema, table):
+    """Get check constraints for a specific table"""
+    query = """
+        SELECT
+            tc.constraint_name,
+            cc.check_clause,
+            (SELECT COUNT(*) 
+             FROM information_schema.constraint_column_usage ccu
+             WHERE ccu.constraint_name = tc.constraint_name
+             AND ccu.constraint_schema = tc.table_schema) as column_count
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.check_constraints cc
+            ON tc.constraint_name = cc.constraint_name
+            AND tc.table_schema = cc.constraint_schema
+        WHERE tc.constraint_type = 'CHECK'
+        AND tc.table_schema = %s
+        AND tc.table_name = %s
+        ORDER BY tc.constraint_name;
+    """
+    cursor.execute(query, (schema, table))
+
+    # Filter out single-column NOT NULL checks
+    constraints = []
+    for constraint_name, check_clause, column_count in cursor.fetchall():
+        # Skip if it's a simple NOT NULL check on one column
+        check_lower = check_clause.lower().strip()
+        if column_count == 1 and 'is not null' in check_lower and check_lower.count('(') <= 2:
+            continue
+        constraints.append((constraint_name, check_clause))
+
+    return constraints
 
 
 def get_table_columns(cursor, schema, table):
@@ -245,67 +325,76 @@ def generate_ddl(host, port, database, user, password, schema, output_file):
     ddl_output = []
     ddl_output.append(f"-- DDL for schema: {schema}")
     ddl_output.append(f"-- Generated from database: {database}\n")
-    ddl_output.append(f"CREATE SCHEMA IF NOT EXISTS {schema};\n")  
+    ddl_output.append(f"CREATE SCHEMA IF NOT EXISTS {schema};\n")
 
     # Generate ENUM types
-    ddl_output.append("-- ENUM Types")
     enums = get_enums(cursor, schema)
     if enums:
+        ddl_output.append("-- ENUM Types")
         for enum_name, enum_values in enums:
             values_str = ', '.join([f"'{v}'" for v in enum_values])
             ddl_output.append(f"CREATE TYPE {schema}.{enum_name} AS ENUM ({values_str});")
         ddl_output.append("")
-    else:
-        ddl_output.append("-- No ENUM types found\n")
 
     # Get all tables
-    ddl_output.append("-- Tables")
     tables = get_tables(cursor, schema)
 
-    if not tables:
-        print(f"No tables found in schema '{schema}'", file=sys.stderr)
-        cursor.close()
-        conn.close()
-        sys.exit(1)
+    if tables:
+        ddl_output.append("-- Tables")
 
-    # Build dependency map
-    table_dependencies = {}
-    table_data = {}
+        # Build dependency map
+        table_dependencies = {}
+        table_data = {}
 
-    for table in tables:
-        columns = get_table_columns(cursor, schema, table)
-        pk_columns = get_primary_key(cursor, schema, table)
-        fk_data = get_foreign_keys(cursor, schema, table)
+        for table in tables:
+            columns = get_table_columns(cursor, schema, table)
+            pk_columns = get_primary_key(cursor, schema, table)
+            fk_data = get_foreign_keys(cursor, schema, table)
 
-        # Store table data
-        table_data[table] = {
-            'columns': columns,
-            'pk_columns': pk_columns,
-            'fk_data': fk_data
-        }
+            # Store table data
+            table_data[table] = {
+                'columns': columns,
+                'pk_columns': pk_columns,
+                'fk_data': fk_data
+            }
 
-        # Extract dependencies (referenced tables)
-        dependencies = set()
-        for fk in fk_data:
-            ref_table = fk[1]
-            if ref_table != table:  # Ignore self-references
-                dependencies.add(ref_table)
-        table_dependencies[table] = dependencies
+            # Extract dependencies (referenced tables)
+            dependencies = set()
+            for fk in fk_data:
+                ref_table = fk[1]
+                if ref_table != table:  # Ignore self-references
+                    dependencies.add(ref_table)
+            table_dependencies[table] = dependencies
 
-    # Sort tables by dependencies
-    sorted_tables = topological_sort_tables(tables, table_dependencies)
+        # Sort tables by dependencies
+        sorted_tables = topological_sort_tables(tables, table_dependencies)
 
-    # Generate CREATE TABLE statements in dependency order
-    for table in sorted_tables:
-        data = table_data[table]
-        ddl_output.append(f"\n-- Table: {table}")
-        ddl_output.append(generate_create_table(
-            schema, 
-            table, 
-            data['columns'], 
-            data['pk_columns'], 
-            data['fk_data']
-        ))
+        # Generate CREATE TABLE statements with their indexes and constraints
+        for table in sorted_tables:
+            data = table_data[table]
+            ddl_output.append("")
+            ddl_output.append(generate_create_table(
+                schema, 
+                table, 
+                data['columns'], 
+                data['pk_columns'], 
+                data['fk_data']
+            ))
+
+            # Add indexes for this table
+            indexes = get_indexes_for_table(cursor, schema, table)
+            for index_name, index_def in indexes:
+                ddl_output.append(f"{index_def};")
+
+            # Add unique constraints for this table
+            unique_constraints = get_unique_constraints_for_table(cursor, schema, table)
+            for constraint_name, columns in unique_constraints:
+                ddl_output.append(f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {constraint_name} UNIQUE ({columns});")
+
+            # Add check constraints for this table
+            check_constraints = get_check_constraints_for_table(cursor, schema, table)
+            for constraint_name, check_clause in check_constraints:
+                ddl_output.append(f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {constraint_name} CHECK ({check_clause});")
 
     cursor.close()
     conn.close()
