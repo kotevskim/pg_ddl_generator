@@ -185,7 +185,6 @@ def get_functions(cursor, schema):
     return cursor.fetchall()
 
 
-
 def get_single_column_unique_constraints(cursor, schema, table):
     """Get single-column unique constraints for inlining"""
     query = """
@@ -198,12 +197,17 @@ def get_single_column_unique_constraints(cursor, schema, table):
         WHERE tc.constraint_type = 'UNIQUE'
         AND tc.table_schema = %s
         AND tc.table_name = %s
-        GROUP BY tc.constraint_name, kcu.column_name
-        HAVING COUNT(*) = 1;
+        AND tc.constraint_name IN (
+            SELECT constraint_name
+            FROM information_schema.key_column_usage
+            WHERE table_schema = %s
+            AND table_name = %s
+            GROUP BY constraint_name
+            HAVING COUNT(*) = 1
+        );
     """
-    cursor.execute(query, (schema, table))
+    cursor.execute(query, (schema, table, schema, table))
     return [row[0] for row in cursor.fetchall()]
-
 
 
 def get_unique_constraints_columns(cursor, schema, table):
