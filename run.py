@@ -542,66 +542,72 @@ def format_column_type(data_type, udt_name, char_length, num_precision, num_scal
 
     return data_type
 
+def quote_identifier(name):
+    """Quote identifier if it's a PostgreSQL reserved keyword"""
+    # PostgreSQL reserved keywords that commonly appear as column names
+    reserved_keywords = {
+        'default', 'user', 'check', 'table', 'column', 'key', 'value', 
+        'order', 'group', 'limit', 'offset', 'desc', 'asc', 'all', 'any',
+        'between', 'case', 'when', 'then', 'else', 'end', 'distinct',
+        'where', 'having', 'select', 'from', 'join', 'left', 'right',
+        'inner', 'outer', 'cross', 'on', 'using', 'natural', 'union',
+        'intersect', 'except', 'create', 'alter', 'drop', 'grant', 'revoke'
+    }
+    
+    if name.lower() in reserved_keywords:
+        return f'"{name}"'
+    return name
+
+
 def generate_create_table(schema, table, columns, pk_columns, fk_data, unique_columns):
     """Generate CREATE TABLE statement"""
     lines = []
     lines.append(f"CREATE TABLE {schema}.{table} (")
 
-
     column_defs = []
     fk_map = {fk[0]: (fk[1], fk[2], fk[3]) for fk in fk_data}
-
 
     for col in columns:
         col_name, data_type, udt_name, char_len, num_prec, num_scale, nullable, default, position, udt_schema = col
 
         col_type = format_column_type(data_type, udt_name, char_len, num_prec, num_scale, default, udt_schema)
-        col_def = f"    {col_name} {col_type}"
-
+        col_def = f"    {quote_identifier(col_name)} {col_type}"
 
         # Add primary key inline for single column PKs
         if col_name in pk_columns and len(pk_columns) == 1:
             col_def += " PRIMARY KEY"
 
-
         # Add foreign key inline (with schema prefix if cross-schema)
         if col_name in fk_map:
             ref_schema, ref_table, ref_column = fk_map[col_name]
-            col_def += f" REFERENCES {ref_schema}.{ref_table}({ref_column})"
-
+            col_def += f" REFERENCES {ref_schema}.{ref_table}({quote_identifier(ref_column)})"
 
         # Add NOT NULL
         if nullable == 'NO' and col_name not in pk_columns:
             col_def += " NOT NULL"
 
-
         # Add UNIQUE for single-column unique constraints
         if col_name in unique_columns:
             col_def += " UNIQUE"
-
 
         # Add DEFAULT (skip for serial types)
         if default and 'nextval' not in default:
             col_def += f" DEFAULT {default}"
 
-
         column_defs.append(col_def)
-
 
     # Add composite primary key constraint
     if len(pk_columns) > 1:
-        pk_def = f"    PRIMARY KEY ({', '.join(pk_columns)})"
+        quoted_pk_cols = ', '.join(quote_identifier(col) for col in pk_columns)
+        pk_def = f"    PRIMARY KEY ({quoted_pk_cols})"
         column_defs.append(pk_def)
-
 
     # Join column definitions with commas and newlines
     columns_text = ",\n".join(column_defs)
     lines.append(columns_text)
     lines.append(");")
 
-
     return "\n".join(lines)
-
 
 
 def generate_schema_ddl(cursor, schema, include_views, include_functions):
@@ -698,7 +704,8 @@ def generate_schema_ddl(cursor, schema, include_views, include_functions):
             # Add unique constraints for this table (multi-column only now)
             unique_constraints = get_unique_constraints_for_table(cursor, schema, table)
             for constraint_name, columns in unique_constraints:
-                ddl_output.append(f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {constraint_name} UNIQUE ({columns});")
+                quoted_columns = ', '.join(quote_identifier(col.strip()) for col in columns.split(','))
+                ddl_output.append(f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {constraint_name} UNIQUE ({quoted_columns});")
 
 
             # Add check constraints for this table
