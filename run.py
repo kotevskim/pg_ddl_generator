@@ -57,6 +57,34 @@ def get_tables(cursor, schema):
     return [row[0] for row in cursor.fetchall()]
 
 
+def get_views(cursor, schema):
+    """Get all views in the schema"""
+    query = """
+        SELECT table_name, view_definition
+        FROM information_schema.views
+        WHERE table_schema = %s
+        ORDER BY table_name;
+    """
+    cursor.execute(query, (schema,))
+    return cursor.fetchall()
+
+
+def get_functions(cursor, schema):
+    """Get all functions in the schema"""
+    query = """
+        SELECT 
+            p.proname as function_name,
+            pg_get_functiondef(p.oid) as function_def
+        FROM pg_proc p
+        JOIN pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = %s
+        AND p.prokind = 'f'
+        ORDER BY p.proname;
+    """
+    cursor.execute(query, (schema,))
+    return cursor.fetchall()
+
+
 def get_indexes_for_table(cursor, schema, table):
     """Get all indexes for a specific table (excluding primary keys and single unique indexes on id)"""
     query = """
@@ -317,7 +345,7 @@ def generate_create_table(schema, table, columns, pk_columns, fk_data):
     return "\n".join(lines)
 
 
-def generate_ddl(host, port, database, user, password, schema, output_file):
+def generate_ddl(host, port, database, user, password, schema, output_file, include_views, include_functions):
     """Main function to generate DDL"""
     conn = connect_db(host, port, database, user, password)
     cursor = conn.cursor()
@@ -396,6 +424,27 @@ def generate_ddl(host, port, database, user, password, schema, output_file):
             for constraint_name, check_clause in check_constraints:
                 ddl_output.append(f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {constraint_name} CHECK ({check_clause});")
 
+    # Generate views if requested
+    if include_views:
+        views = get_views(cursor, schema)
+        if views:
+            ddl_output.append("\n-- Views")
+            for view_name, view_def in views:
+                view_def = view_def.strip()
+                if not view_def.endswith(';'):
+                    view_def += ';'
+                ddl_output.append(f"CREATE OR REPLACE VIEW {schema}.{view_name} AS\n{view_def}")
+                ddl_output.append("")
+
+    # Generate functions if requested
+    if include_functions:
+        functions = get_functions(cursor, schema)
+        if functions:
+            ddl_output.append("-- Functions")
+            for func_name, func_def in functions:
+                ddl_output.append(func_def)
+                ddl_output.append("")
+
     cursor.close()
     conn.close()
 
@@ -417,7 +466,7 @@ def main():
 Example usage:
   python pg_ddl_generator.py --host localhost --port 5432 --database mydb \\
                               --user postgres --password secret --schema public \\
-                              --output schema.sql
+                              --output schema.sql --include-views --include-functions
         """
     )
 
@@ -428,6 +477,8 @@ Example usage:
     parser.add_argument('--password', required=True, help='Database password')
     parser.add_argument('--schema', required=True, help='Schema name to generate DDL for')
     parser.add_argument('--output', '-o', help='Output file (default: stdout)')
+    parser.add_argument('--include-views', action='store_true', help='Include views in the output')
+    parser.add_argument('--include-functions', action='store_true', help='Include functions in the output')
 
     args = parser.parse_args()
 
@@ -438,7 +489,9 @@ Example usage:
         args.user,
         args.password,
         args.schema,
-        args.output
+        args.output,
+        args.include_views,
+        args.include_functions
     )
 
 
